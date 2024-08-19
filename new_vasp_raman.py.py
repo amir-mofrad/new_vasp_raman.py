@@ -1,0 +1,690 @@
+
+#!/usr/bin/env python3
+#
+# This is an upgraded version
+# of the vasp_raman.py code that
+# was developed by Fonari to
+# be compatible with Python 3
+#
+# NEW vasp_raman.py v. 0.7.0
+# OLD vasp_raman.py v. 0.6.0
+#
+# This is a for sure beta version
+# use with caution!
+#
+# Testing dummy data is also provided
+# to debug and make sure the code
+# does what it's supposed to.
+#
+# For the details regarding how to run
+# on HPC machines refer to README.
+#
+# Below are the detials of the original code
+# Raman off-resonant activity calculator
+# using VASP as a back-end.
+#
+# Contributors: Alexandr Fonari (Georgia Tech)
+# Shannon Stauffer (UT Austin)
+#
+# URL: http://raman-sc.github.io
+#
+# MIT license, 2013 - 2016
+#
+
+import re
+import os
+import argparse
+import datetime
+import sys
+import numpy as np
+from math import sqrt
+from math import pi
+from shutil import move
+from io import StringIO
+
+
+def mat_vec_mult(m, v):
+    """
+    Multiply a matrix by a vector using NumPy for efficient computation.
+
+    Parameters:
+    m (list of list of floats): The matrix to be multiplied.
+    v (list of floats): The vector to multiply the matrix by.
+
+    Returns:
+    np.ndarray: The result of the matrix-vector multiplication.
+    """
+    m = np.array(m)
+    v = np.array(v)
+    
+    # Validate dimensions
+    if m.shape[1] != v.shape[0]:
+        raise ValueError('Number of columns in the matrix must be equal to the number of rows in the vector')
+    
+    # Use NumPy's dot product for efficient computation
+    return np.dot(m, v)
+
+'''
+# Test the function with a larger dataset for benchmarking
+matrix = np.random.rand(1000, 1000)  # Large 1000x1000 matrix
+vector = np.random.rand(1000)        # Large 1000-element vector
+
+result = mat_vec_mult(matrix, vector)
+
+# Print a small part of the result to verify correctness
+print("First 10 elements of the result:", result[:10])
+'''
+
+def transpose_matrix(m):
+    """
+    Transpose a matrix using NumPy for efficient computation.
+
+    Parameters:
+    m (list of list of floats): The matrix to be transposed.
+
+    Returns:
+    np.ndarray: The transposed matrix.
+    """
+    m = np.array(m)
+    
+    # Ensure it's a 2D array
+    if m.ndim != 2:
+        raise ValueError("Input must be a 2D matrix")
+    
+    # Use NumPy's transpose method
+    p = m.T
+    
+    return p
+
+'''
+# Test the function with a sample matrix
+matrix = [
+    [1, 2, 3],
+    [4, 5, 6],
+    [7, 8, 9]
+]
+
+result = transpose_matrix(matrix)
+print("Transposed matrix:\n", result)
+'''
+
+def parse_poscar(poscar_fh):
+    """
+    Parses a POSCAR file to extract unit cell information, including lattice vectors, volume, atom counts, and positions.
+
+    Parameters:
+    poscar_fh (file handle): A file handle to the POSCAR file.
+
+    Returns:
+    tuple: (nat, vol, b, positions, poscar_header)
+        nat (int): Total number of atoms.
+        vol (float): Volume of the unit cell.
+        b (np.ndarray): Lattice vectors.
+        positions (list of np.ndarray): List of atomic positions in Cartesian coordinates.
+        poscar_header (str): POSCAR header information.
+    """
+    
+    # Ensure file pointer is at the beginning
+    poscar_fh.seek(0)
+
+    # Read all lines from the POSCAR file
+    lines = poscar_fh.readlines()
+
+    # Parse the scale factor from the second line
+    try:
+        scale = float(lines[1].strip())
+    except ValueError:
+        raise ValueError("Invalid scale factor in POSCAR file.")
+    
+    if scale < 0.0:
+        raise ValueError("Negative scale not implemented.")
+    
+    # Parse lattice vectors and apply the scale factor
+    b = np.array([list(map(float, lines[i].split()[:3])) for i in range(2, 5)]) * scale
+
+    # Calculate the volume of the unit cell using the determinant
+    vol = np.linalg.det(b)
+
+    # Parse number of atoms or chemical symbols
+    try:
+        num_atoms = list(map(int, lines[5].split()))
+        line_at = 6
+    except ValueError:
+        symbols = lines[5].split()
+        num_atoms = list(map(int, lines[6].split()))
+        line_at = 7
+
+    # Total number of atoms
+    nat = sum(num_atoms)
+
+    # Check for selective dynamics
+    if lines[line_at].strip().lower().startswith('s'):
+        line_at += 1
+
+    # Determine if coordinates are Cartesian or Direct
+    is_scaled = not lines[line_at].strip().lower().startswith(('c', 'k'))
+
+    line_at += 1  # Move to the line with atomic positions
+
+    # Parse atomic positions
+    positions = []
+    for i in range(line_at, line_at + nat):
+        pos = np.array(list(map(float, lines[i].split()[:3])))
+
+        # Convert to Cartesian coordinates if in Direct mode
+        if is_scaled:
+            pos = np.dot(b.T, pos)  # Use numpy dot product for matrix-vector multiplication
+
+        positions.append(pos)
+
+    # Construct the POSCAR header
+    poscar_header = ''.join(lines[1:line_at-1])
+
+    return nat, vol, b, positions, poscar_header
+
+'''
+# Test the function with a mock POSCAR file
+from io import StringIO
+
+# Sample POSCAR content as a string
+poscar_content = """\
+Generated by VASP
+1.0
+3.186 0.000 0.000
+0.000 3.186 0.000
+0.000 0.000 3.186
+Si
+2
+Direct
+0.000 0.000 0.000
+0.250 0.250 0.250
+"""
+
+# Create a file-like object from the string
+poscar_fh = StringIO(poscar_content)
+
+# Parse the POSCAR data
+nat, vol, b, positions, poscar_header = parse_poscar(poscar_fh)
+
+# Output the parsed data
+print("Number of atoms:", nat)
+print("Volume of unit cell:", vol)
+print("Lattice vectors:\n", b)
+print("Atomic positions:\n", positions)
+print("POSCAR header:\n", poscar_header)
+'''
+
+def parse_env_params(params):
+    """
+    Parses a string of parameters separated by underscores and returns them as integers and floats.
+
+    Parameters:
+    params (str): A string containing four parameters separated by underscores.
+
+    Returns:
+    tuple: (first, last, nderiv, step_size)
+        first (int): The first parameter.
+        last (int): The second parameter.
+        nderiv (int): The third parameter.
+        step_size (float): The fourth parameter.
+    """
+    # Strip whitespace and split the string into components
+    tmp = params.strip().split('_')
+
+    # Ensure there are exactly four parameters
+    if len(tmp) != 4:
+        raise ValueError("[parse_env_params]: ERROR there should be exactly four parameters")
+
+    # Parse and convert each parameter
+    first = int(tmp[0])
+    last = int(tmp[1])
+    nderiv = int(tmp[2])
+    step_size = float(tmp[3])
+
+    return first, last, nderiv, step_size
+
+#### subs for the output from VTST tools
+def parse_freqdat(freqdat_fh, nat):
+    """
+    Parses a frequency data file to extract vibrational frequencies.
+
+    Parameters:
+    freqdat_fh (file handle): A file handle to the frequency data file.
+    nat (int): The number of atoms in the system.
+
+    Returns:
+    list of float: The list of vibrational frequencies.
+    """
+    # Ensure file pointer is at the beginning
+    freqdat_fh.seek(0)
+
+    # Initialize the list of eigenvalues
+    eigvals = np.zeros(nat * 3)
+    
+    # Read and parse each frequency value
+    for i in range(nat * 3):
+        tmp = freqdat_fh.readline().split()
+        eigvals[i] = float(tmp[0])
+
+    return eigvals
+
+'''
+# Test the function with a mock frequency data file
+from io import StringIO
+
+# Sample frequency data as a string
+freqdat_content = """\
+123.45
+234.56
+345.67
+456.78
+567.89
+678.90
+"""
+
+# Create a file-like object from the string
+freqdat_fh = StringIO(freqdat_content)
+
+# Define the number of atoms
+nat = 2
+
+# Parse the frequency data
+eigvals = parse_freqdat(freqdat_fh, nat)
+
+# Output the parsed eigenvalues
+print("Eigenvalues (Frequencies):", eigvals)
+'''
+
+def parse_modesdat(modesdat_fh, nat):
+    """
+    Parses a modes data file to extract eigenvectors and their norms.
+
+    Parameters:
+    modesdat_fh (file handle): A file handle to the modes data file.
+    nat (int): The number of atoms in the system.
+
+    Returns:
+    tuple: (eigvecs, norms)
+        eigvecs (list of list of list of float): The eigenvectors for each mode.
+        norms (list of float): The norms of each eigenvector.
+    """
+    # Ensure file pointer is at the beginning
+    modesdat_fh.seek(0)
+
+    # Initialize lists for eigenvectors and norms
+    eigvecs = np.zeros((nat * 3, nat, 3))
+    norms = np.zeros(nat * 3)
+
+    # Read and parse each eigenvector
+    for i in range(nat * 3):
+        eigvec = []
+        for j in range(nat):
+            line = modesdat_fh.readline()
+            
+            # Check for premature end of file
+            if not line:
+                raise ValueError(f"Unexpected end of data: missing eigenvector for atom {j+1} in mode {i+1}.")
+            
+            tmp = line.strip().split()
+
+            # Ensure each line has exactly 3 components (x, y, z)
+            if len(tmp) != 3:
+                raise ValueError(f"Expected 3 components for atom {j+1} in mode {i+1}, but got: {line.strip()}")
+
+            eigvec.append([float(tmp[x]) for x in range(3)])
+
+        # Attempt to read and discard the empty line between modes
+        empty_line = modesdat_fh.readline().strip()
+        if empty_line and i < (nat * 3) - 1:  # Only expect an empty line between modes
+            raise ValueError(f"Expected an empty line after mode {i+1}, but got: {empty_line}")
+
+        # Store the eigenvector and calculate its norm
+        eigvecs[i] = eigvec
+        norms[i] = sqrt(sum(x**2 for sublist in eigvec for x in sublist))
+
+    return eigvecs, norms
+
+'''
+# Test the function with a mock modes data file
+from io import StringIO
+
+# Sample modes data content as a string
+modesdat_content = """\
+0.1 0.2 0.3
+0.4 0.5 0.6
+
+0.7 0.8 0.9
+1.0 1.1 1.2
+
+1.3 1.4 1.5
+1.6 1.7 1.8
+
+1.9 2.0 2.1
+2.2 2.3 2.4
+
+2.5 2.6 2.7
+2.8 2.9 3.0
+
+3.1 3.2 3.3
+3.4 3.5 3.6
+"""
+
+# Create a file-like object from the string
+modesdat_fh = StringIO(modesdat_content)
+
+# Define the number of atoms
+nat = 2
+
+# Parse the modes data
+eigvecs, norms = parse_modesdat(modesdat_fh, nat)
+
+# Output the parsed eigenvectors and norms
+print("Eigenvectors:")
+for i, eigvec in enumerate(eigvecs):
+    print(f"Mode {i+1}: {eigvec}")
+
+print("\nNorms of each eigenvector:")
+print(norms)
+'''
+#### end subs for VTST
+
+def get_modes_from_OUTCAR(outcar_fh, nat):
+    """
+    Extracts eigenvalues and eigenvectors from an OUTCAR file generated by VASP.
+
+    Parameters:
+    outcar_fh (file handle): A file handle to the OUTCAR file.
+    nat (int): The number of atoms in the system.
+
+    Returns:
+    tuple: (eigvals, eigvecs, norms)
+        eigvals (np.ndarray): The vibrational frequencies in cm-1.
+        eigvecs (np.ndarray): The eigenvectors for each mode.
+        norms (np.ndarray): The norms of each eigenvector.
+    """
+    # Initialize arrays for eigenvalues, eigenvectors, and norms
+    eigvals = np.zeros(nat * 3)
+    eigvecs = np.zeros((nat * 3, nat, 3))
+    norms = np.zeros(nat * 3)
+
+    # Ensure file pointer is at the beginning
+    outcar_fh.seek(0)
+
+    # Read lines to find the eigenvector data
+    while True:
+        line = outcar_fh.readline()
+        if not line:
+            break
+        
+        if "Eigenvectors after division by SQRT(mass)" in line:
+            # Skip unnecessary lines
+            outcar_fh.readline()  # empty line
+            outcar_fh.readline()  # Eigenvectors and eigenvalues of the dynamical matrix
+            outcar_fh.readline()  # ----------------------------------------------------
+            outcar_fh.readline()  # empty line
+
+            for i in range(nat * 3):  # Iterate over all modes
+                outcar_fh.readline()  # Skip the empty line before the frequency line
+                freq_line = outcar_fh.readline()  # Frequency line
+
+		# Use the original regex pattern for matching eigenvalue lines
+                match = re.search(r'^\s*(\d+).+?([\.\d]+) cm-1', freq_line) 	               
+                
+                # Check for successful regex match
+                if not match:
+                    raise ValueError(f"Failed to parse eigenvalue for mode {i+1} in OUTCAR: {freq_line}")
+                
+                eigvals[i] = float(match.group(1))
+
+                # Skip header line for eigenvectors
+                header_line = outcar_fh.readline().strip()  # X Y Z dx dy dz
+                if not header_line.startswith('X'):
+                    raise ValueError(f"Expected eigenvector header line, but got: {header_line}")
+
+                for j in range(nat):  # Iterate over each atom
+                    atom_line = outcar_fh.readline().strip()
+                    tmp = atom_line.split()
+
+                    if len(tmp) < 6:
+                        raise ValueError(f"Failed to parse eigenvector for atom {j+1} in mode {i+1}: {atom_line}")
+
+                    # Store eigenvector components directly into the NumPy array
+                    eigvecs[i, j, :] = [float(tmp[x]) for x in range(3, 6)]
+
+                # Calculate the norm of the eigenvector
+                norms[i] = np.linalg.norm(eigvecs[i])
+
+            return eigvals, eigvecs, norms
+
+    raise RuntimeError("[get_modes_from_OUTCAR]: ERROR Couldn't find 'Eigenvectors after division by SQRT(mass)' in OUTCAR. Use 'NWRITE=3' in INCAR.")
+
+
+def get_epsilon_from_OUTCAR(outcar_fh):
+    """
+    Extracts the macroscopic static dielectric tensor from an OUTCAR file.
+
+    Parameters:
+    outcar_fh (file handle): A file handle to the OUTCAR file.
+
+    Returns:
+    np.ndarray: A 3x3 NumPy array representing the dielectric tensor.
+    """
+    # Ensure file pointer is at the beginning
+    outcar_fh.seek(0)
+
+    # Iterate over lines to find the dielectric tensor
+    for line in outcar_fh:
+        if "MACROSCOPIC STATIC DIELECTRIC TENSOR" in line:
+            outcar_fh.readline()  # Skip the next line
+            epsilon = np.array([  # Read the next three lines as floats and form a NumPy array
+                list(map(float, outcar_fh.readline().split())),
+                list(map(float, outcar_fh.readline().split())),
+                list(map(float, outcar_fh.readline().split()))
+            ])
+            return epsilon
+
+    raise RuntimeError("[get_epsilon_from_OUTCAR]: ERROR Couldn't find dielectric tensor in OUTCAR")
+
+# Mock OUTCAR content with a dielectric tensor
+'''
+outcar_content = """\
+Other content in the file...
+MACROSCOPIC STATIC DIELECTRIC TENSOR (including local field effects in DFT)
+-------------------------------------
+    10.0000    0.1000    0.2000
+     0.1000   10.5000    0.3000
+     0.2000    0.3000   11.0000
+End of tensor, more content...
+"""
+
+# Create a file-like object from the string
+outcar_fh = StringIO(outcar_content)
+
+# Extract the dielectric tensor
+epsilon = get_epsilon_from_OUTCAR(outcar_fh)
+
+# Print the extracted dielectric tensor for verification
+print("Dielectric Tensor:")
+print(epsilon)
+'''
+def prepare_displaced_poscar(disp_filename, step_size, poscar_header, pos, eigvec, disp, norm, nat):
+    """
+    Prepares a displaced POSCAR file based on the displacement and mode information.
+    """
+    with open('POSCAR', 'w') as poscar_fh:
+        poscar_fh.write("{} {:.1e} \n".format(disp_filename, step_size))
+        poscar_fh.write(poscar_header)
+        poscar_fh.write("Cartesian\n")
+        
+        for k in range(nat):
+            pos_disp = [pos[k][l] + eigvec[k][l] * step_size * disp / norm for l in range(3)]
+            poscar_fh.write('{:15.10f} {:15.10f} {:15.10f}\n'.format(*pos_disp))
+
+
+def run_vasp_and_move_output(VASP_RAMAN_RUN, disp_filename):
+    """
+    Runs VASP and moves the OUTCAR file to the specified filename.
+    """
+    os.system(VASP_RAMAN_RUN)
+    try:
+        move('OUTCAR', disp_filename)
+    except IOError:
+        raise RuntimeError("[__main__]: ERROR Couldn't find OUTCAR file after VASP run.")
+
+def main():
+    # Initial program information
+    print("\nRaman off-resonant activity calculator, using VASP as a back-end.\n")
+    print("Contributors: Alexandr Fonari  (Georgia Tech)")
+    print("              Shannon Stauffer (UT Austin)")
+    print("MIT License, 2013")
+    print("URL: http://raman-sc.github.io")
+    print("Started at: {}\n".format(datetime.datetime.now().strftime("%Y-%m-%d %H:%M")))
+
+    # Description and argument parsing using argparse
+    description = (
+        "Before running, set environment variables:\n"
+        "    VASP_RAMAN_RUN='mpirun vasp'\n"
+        "    VASP_RAMAN_PARAMS='[first-mode]_[last-mode]_[nderiv]_[step-size]'\n\n"
+        "Bash one-liner:\n"
+        "VASP_RAMAN_RUN='mpirun vasp' VASP_RAMAN_PARAMS='1_2_2_0.01' python vasp_raman.py"
+    )
+    
+    parser = argparse.ArgumentParser(description=description)
+    parser.add_argument('-g', '--gen', help='Generate POSCAR only', action='store_true')
+    parser.add_argument('-u', '--use_poscar', help='Use provided POSCAR in the folder, USE WITH CAUTION!!', action='store_true')
+    args = parser.parse_args()
+
+    # Environment variables retrieval
+    VASP_RAMAN_RUN = os.environ.get('VASP_RAMAN_RUN')
+    if VASP_RAMAN_RUN is None:
+        parser.error("Set environment variable 'VASP_RAMAN_RUN'.")
+
+    print("[__main__]: VASP_RAMAN_RUN='{}'".format(VASP_RAMAN_RUN))
+
+    VASP_RAMAN_PARAMS = os.environ.get('VASP_RAMAN_PARAMS')
+    if VASP_RAMAN_PARAMS is None:
+        parser.error("Set environment variable 'VASP_RAMAN_PARAMS'.")
+
+    print("[__main__]: VASP_RAMAN_PARAMS='{}'".format(VASP_RAMAN_PARAMS))
+
+    # Parse environment parameters
+    first, last, nderiv, step_size = parse_env_params(VASP_RAMAN_PARAMS)
+    
+    # Validate parsed parameters
+    if first < 1:
+        parser.error('[__main__]: First mode should be equal or larger than 1')
+    
+    if last < first:
+        parser.error('[__main__]: Last mode should be equal or larger than first mode')
+    
+    if args.gen and last != first:
+        parser.error("[__main__]: '-gen' mode -> only generation for the one mode makes sense")
+
+    if nderiv != 2:
+        parser.error('[__main__]: At this time, nderiv = 2 is the only supported')
+
+    # Hardcoded values
+    disps = [-1, 1]       # displacements
+    coeffs = [-0.5, 0.5]  # coefficients for three-point stencil (nderiv=2)
+    
+    # Parse the POSCAR file
+    try:
+        with open('POSCAR.phon', 'r') as poscar_fh:
+            nat, vol, b, pos, poscar_header = parse_poscar(poscar_fh)
+    except IOError:
+        raise RuntimeError("[__main__]: ERROR Couldn't open input file POSCAR.phon")
+
+    print(pos)
+
+    # Determine which files to use for mode data
+    if os.path.isfile('freq.dat') and os.path.isfile('modes_sqrt_amu.dat'):
+        try:
+            with open('freq.dat', 'r') as freqdat_fh:
+                eigvals = parse_freqdat(freqdat_fh, nat)
+        except IOError:
+            raise RuntimeError("[__main__]: ERROR Couldn't open freq.dat")
+
+        try:
+            with open('modes_sqrt_amu.dat', 'r') as modes_fh:
+                eigvecs, norms = parse_modesdat(modes_fh, nat)
+        except IOError:
+            raise RuntimeError("[__main__]: ERROR Couldn't open modes_sqrt_amu.dat")
+
+    elif os.path.isfile('OUTCAR.phon'):
+        try:
+            with open('OUTCAR.phon', 'r') as outcar_fh:
+                eigvals, eigvecs, norms = get_modes_from_OUTCAR(outcar_fh, nat)
+        except IOError:
+            raise RuntimeError("[__main__]: ERROR Couldn't open OUTCAR.phon")
+
+    else:
+        raise RuntimeError("[__main__]: Neither OUTCAR.phon nor freq.dat/modes_sqrt_amu.dat were found, nothing to do.")
+    
+        # Output file handling
+    with open('vasp_raman.dat', 'w') as output_fh:
+        output_fh.write("# mode    freq(cm-1)    alpha    beta2    activity\n")
+        
+        for i in range(first - 1, last):
+            eigval = eigvals[i]
+            eigvec = eigvecs[i]
+            norm = norms[i]
+
+            print("\n[__main__]: Mode #{}: frequency {:.7f} cm-1; norm: {:.7f}".format(i + 1, eigval, norm))
+
+            ra = np.zeros((3, 3))  # NumPy array for Raman activity
+
+            for j, disp in enumerate(disps):
+                disp_filename = 'OUTCAR.{:04d}.{:+d}.out'.format(i + 1, disp)
+                
+                # Handle file operations and VASP runs
+                if not os.path.isfile(disp_filename):
+                    if not args.use_poscar:
+                        prepare_displaced_poscar(disp_filename, step_size, poscar_header, pos, eigvec, disps[j], norm, nat)
+                        
+                        if args.gen:
+                            poscar_fn = 'POSCAR.{:+d}.out'.format(disp)
+                            move('POSCAR', poscar_fn)
+                            print("[__main__]: '-gen' mode -> {} with displaced atoms have been generated".format(poscar_fn))
+                            
+                            if j + 1 == len(disps):
+                                print("[__main__]: '-gen' mode -> POSCAR files with displaced atoms have been generated, exiting now")
+                                return
+                        else:
+                            print("[__main__]: Running VASP...")
+                            run_vasp_and_move_output(VASP_RAMAN_RUN, disp_filename)
+                    else:
+                        print("[__main__]: Using provided POSCAR")
+                
+                # Parse epsilon tensor from OUTCAR
+                try:
+                    with open(disp_filename, 'r') as outcar_fh:
+                        eps = get_epsilon_from_OUTCAR(outcar_fh)
+                except Exception as err:
+                    print(err)
+                    print("[__main__]: Moving {} back to 'OUTCAR' and exiting...".format(disp_filename))
+                    move(disp_filename, 'OUTCAR')
+                    sys.exit(1)
+                
+                # Calculate Raman activity
+                ra += np.array(eps) * coeffs[j] / step_size * norm * vol / (4.0 * pi)
+
+            # Calculate Raman activity components
+            alpha = np.trace(ra) / 3.0
+            beta2 = (
+                ((ra[0][0] - ra[1][1]) ** 2 + (ra[0][0] - ra[2][2]) ** 2 + (ra[1][1] - ra[2][2]) ** 2) 
+                + 6.0 * (ra[0][1] ** 2 + ra[0][2] ** 2 + ra[1][2] ** 2)
+            ) / 2.0
+
+            activity = 45.0 * alpha**2 + 7.0 * beta2
+
+            print("\n! {:4d}  freq: {:10.5f}  alpha: {:10.7f}  beta2: {:10.7f}  activity: {:10.7f}".format(
+                i + 1, eigval, alpha, beta2, activity
+            ))
+
+            output_fh.write("{:03d}  {:10.5f}  {:10.7f}  {:10.7f}  {:10.7f}\n".format(
+                i + 1, eigval, alpha, beta2, activity
+            ))
+
+if __name__ == '__main__':
+    main()
+
